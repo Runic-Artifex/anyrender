@@ -84,3 +84,12 @@ wasm-bindgen-futures = "0.4"
 
 # Dev-dependencies
 winit = { version = "0.30.2", features = ["rwh_06"] }
+
+# Runic fork: build and test against the sparse-strip crates of the sibling Vello
+# clone (branch "runic": colour matrices and filter chains). Consumers ignore this
+# section and patch the same crates themselves.
+[patch.crates-io]
+vello_cpu = { path = "../vello/vello_cpu" }
+vello_common = { path = "../vello/vello_common" }
+vello_gpu = { path = "../vello/vello_gpu" }
+glifo = { path = "../vello/glifo" }
