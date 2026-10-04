@@ -1,17 +1,19 @@
 use anyrender::{ImageRenderer, RenderContext, ResourceId};
 use peniko::ImageData;
 use rustc_hash::FxHashMap;
-use vello::{Renderer as VelloRenderer, RendererOptions, Scene as VelloScene};
+use vello::{AaConfig, AaSupport, Renderer as VelloRenderer, RendererOptions, Scene as VelloScene};
 use wgpu::TextureUsages;
 use wgpu_context::{BufferRenderer, BufferRendererConfig, WGPUContext};
 
-use crate::{DEFAULT_THREADS, VelloScenePainter};
+use crate::{DEFAULT_THREADS, VelloScenePainter, filters::FilterState};
 
 pub struct VelloImageRenderer {
     buffer_renderer: BufferRenderer,
     vello_renderer: VelloRenderer,
     scene: VelloScene,
     texture_handles: FxHashMap<ResourceId, ImageData>,
+    antialiasing_method: AaConfig,
+    filters: FilterState,
 }
 
 impl VelloImageRenderer {
@@ -22,6 +24,18 @@ impl VelloImageRenderer {
         width: u32,
         height: u32,
         pipeline_cache: Option<wgpu::PipelineCache>,
+    ) -> Self {
+        Self::with_options(width, height, pipeline_cache, AaConfig::Area)
+    }
+
+    /// Like [`ImageRenderer::new`], with the anti-aliasing method of the renderer (area
+    /// coverage by default; a window renderer uses `AaConfig::Msaa16` by default) and a
+    /// pipeline cache as in [`with_pipeline_cache`](Self::with_pipeline_cache).
+    pub fn with_options(
+        width: u32,
+        height: u32,
+        pipeline_cache: Option<wgpu::PipelineCache>,
+        antialiasing_method: AaConfig,
     ) -> Self {
         // Create WGPUContext
         let mut context = WGPUContext::new();
@@ -41,7 +55,19 @@ impl VelloImageRenderer {
             RendererOptions {
                 use_cpu: false,
                 num_init_threads: DEFAULT_THREADS,
-                antialiasing_support: vello::AaSupport::area_only(),
+                antialiasing_support: match antialiasing_method {
+                    AaConfig::Area => AaSupport::area_only(),
+                    AaConfig::Msaa8 => AaSupport {
+                        area: false,
+                        msaa8: true,
+                        msaa16: false,
+                    },
+                    AaConfig::Msaa16 => AaSupport {
+                        area: false,
+                        msaa8: false,
+                        msaa16: true,
+                    },
+                },
                 pipeline_cache,
             },
         )
@@ -52,7 +78,19 @@ impl VelloImageRenderer {
             vello_renderer,
             scene: VelloScene::new(),
             texture_handles: FxHashMap::default(),
+            antialiasing_method,
+            filters: FilterState::default(),
         }
+    }
+
+    /// The anti-aliasing method this renderer draws with.
+    pub fn antialiasing_method(&self) -> AaConfig {
+        self.antialiasing_method
+    }
+
+    /// The adapter the renderer draws on.
+    pub fn adapter_info(&self) -> wgpu::AdapterInfo {
+        self.buffer_renderer.device_handle.adapter.get_info()
     }
 }
 
@@ -90,18 +128,25 @@ impl ImageRenderer for VelloImageRenderer {
         draw_fn: F,
         cpu_buffer: &mut [u8],
     ) {
-        draw_fn(&mut VelloScenePainter {
+        let size = self.buffer_renderer.size();
+        self.filters.size = (size.width, size.height);
+        self.filters.antialiasing = Some(self.antialiasing_method);
+        let mut painter = VelloScenePainter {
             inner: &mut self.scene,
             renderer: Some(&mut self.vello_renderer),
             device_handle: Some(&self.buffer_renderer.device_handle),
             texture_handles: Some(&mut self.texture_handles),
-        });
+            filters: Some(&mut self.filters),
+            layers: Vec::new(),
+        };
+        draw_fn(&mut painter);
+        painter.close_filter_layers();
+        drop(painter);
 
         for handle in self.texture_handles.values() {
             self.vello_renderer.mark_override_image_dirty(handle);
         }
 
-        let size = self.buffer_renderer.size();
         self.vello_renderer
             .render_to_texture(
                 self.buffer_renderer.device(),
@@ -112,12 +157,13 @@ impl ImageRenderer for VelloImageRenderer {
                     base_color: vello::peniko::Color::TRANSPARENT,
                     width: size.width,
                     height: size.height,
-                    antialiasing_method: vello::AaConfig::Area,
+                    antialiasing_method: self.antialiasing_method,
                 },
             )
             .expect("Got non-Send/Sync error from rendering");
 
         self.buffer_renderer.copy_texture_to_buffer(cpu_buffer);
+        self.filters.end_frame(&mut self.vello_renderer);
 
         // Empty the Vello scene (memory optimisation)
         self.scene.reset();

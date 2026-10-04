@@ -20,7 +20,7 @@ use wgpu_context::{
     TextureConfiguration, WGPUContext,
 };
 
-use crate::{DEFAULT_THREADS, VelloScenePainter};
+use crate::{DEFAULT_THREADS, VelloScenePainter, filters::FilterState};
 
 /// Drive the wgpu init future. On wasm32 we spawn it onto the JS microtask
 /// queue (blocking is not allowed). On native we drive it inline with
@@ -167,6 +167,7 @@ pub struct VelloWindowRenderer {
 
     // Resources
     texture_handles: FxHashMap<ResourceId, ImageData>,
+    filters: FilterState,
 }
 
 impl VelloWindowRenderer {
@@ -184,6 +185,7 @@ impl VelloWindowRenderer {
             window_handle: None,
             scene: VelloScene::new(),
             texture_handles: FxHashMap::default(),
+            filters: FilterState::default(),
         }
     }
 
@@ -425,7 +427,9 @@ impl WindowRenderer for VelloWindowRenderer {
             for (_id, handle) in self.texture_handles.drain() {
                 active.renderer.unregister_texture(handle);
             }
+            self.filters.end_frame(&mut active.renderer);
         }
+        self.filters.clear();
         self.render_state = RenderState::Suspended;
     }
 
@@ -445,17 +449,25 @@ impl WindowRenderer for VelloWindowRenderer {
         debug_timer!(timer, feature = "log_frame_times");
 
         // Regenerate the vello scene
-        draw_fn(&mut VelloScenePainter {
+        self.filters.size = (render_surface.config.width, render_surface.config.height);
+        self.filters.antialiasing = Some(self.config.antialiasing_method);
+        let mut painter = VelloScenePainter {
             inner: &mut self.scene,
             renderer: Some(&mut state.renderer),
             device_handle: Some(&render_surface.device_handle),
             texture_handles: Some(&mut self.texture_handles),
-        });
+            filters: Some(&mut self.filters),
+            layers: Vec::new(),
+        };
+        draw_fn(&mut painter);
+        painter.close_filter_layers();
+        drop(painter);
         timer.record_time("cmd");
 
         let Ok(texture_view) = render_surface.target_texture_view() else {
             // Skip frame in case of error trying to get current surface texture
             render_surface.clear_surface_texture();
+            self.filters.end_frame(&mut state.renderer);
             self.scene.reset();
             return;
         };
@@ -479,6 +491,7 @@ impl WindowRenderer for VelloWindowRenderer {
                 },
             )
             .expect("failed to render to texture");
+        self.filters.end_frame(&mut state.renderer);
         timer.record_time("render");
 
         drop(texture_view);
