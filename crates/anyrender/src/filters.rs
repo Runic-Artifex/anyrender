@@ -54,6 +54,8 @@ pub struct Filter {
     /// This is the axis-aligned bounding box of the expansion region (centered at origin),
     /// which can be transformed to device space when needed.
     expansion_rect: Rect,
+    /// The expansion of each primitive's result, including the expansion of its inputs.
+    node_expansions: SmallVec<[Rect; 1]>,
     // TODO: Add bounds restricting where the filter applies.
     // Optional bounds restricting where the filter applies.
     // If `None`, the filter applies to the entire filtered element.
@@ -73,6 +75,7 @@ impl Filter {
             primitives: SmallVec::new(),
             output: FilterId(0),
             expansion_rect: Rect::ZERO,
+            node_expansions: SmallVec::new(),
         }
     }
 
@@ -112,9 +115,30 @@ impl Filter {
     pub fn add(&mut self, effect: FilterEffect, inputs: FilterInputs) -> FilterId {
         let id = FilterId(self.primitives.len() as u16);
 
-        // Update accumulated expansion by taking the union of rects
+        // A primitive expands the region its inputs already cover: the expansion of its
+        // result is the sum of its own and its inputs' expansions. As in SVG, a missing
+        // primary input is the previous primitive's result (the source graphic for the first).
+        let previous = self.node_expansions.last().copied().unwrap_or(Rect::ZERO);
+        let input_expansion = |input: &Option<FilterInput>, default: Rect| match input {
+            None => default,
+            Some(FilterInput::Source(_)) => Rect::ZERO,
+            Some(FilterInput::Result(FilterId(result))) => self
+                .node_expansions
+                .get(usize::from(*result))
+                .copied()
+                .unwrap_or(Rect::ZERO),
+        };
+        let inputs_rect = input_expansion(&inputs.primary, previous)
+            .union(input_expansion(&inputs.secondary, Rect::ZERO));
         let primitive_rect = effect.expansion_rect();
-        self.expansion_rect = self.expansion_rect.union(primitive_rect);
+        let node_rect = Rect::new(
+            inputs_rect.x0 + primitive_rect.x0,
+            inputs_rect.y0 + primitive_rect.y0,
+            inputs_rect.x1 + primitive_rect.x1,
+            inputs_rect.y1 + primitive_rect.y1,
+        );
+        self.node_expansions.push(node_rect);
+        self.expansion_rect = self.expansion_rect.union(node_rect);
 
         self.primitives.push(FilterGraphNode { effect, inputs });
 
@@ -566,6 +590,23 @@ mod offset_expansion_tests {
             p.expansion_rect(),
             Rect::new(0.0, -3.0, 2.5, 0.0),
             "Offset expansion should be asymmetric and include the shift vector"
+        );
+    }
+
+    #[test]
+    fn chained_expansions_add_up() {
+        let filter = super::Filter::linear_list(
+            [
+                FilterEffect::blur(2.0),
+                FilterEffect::Offset(Vec2 { x: 5.0, y: -4.0 }),
+                FilterEffect::blur(1.0),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(filter.expansion_rect(), Rect::new(-9.0, -13.0, 14.0, 9.0));
+        assert_eq!(
+            super::Filter::single(FilterEffect::blur(2.0)).expansion_rect(),
+            Rect::new(-6.0, -6.0, 6.0, 6.0)
         );
     }
 }
