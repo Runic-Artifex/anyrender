@@ -37,10 +37,12 @@ impl ImageRenderer for VelloCpuImageRenderer {
 
     fn resize(&mut self, width: u32, height: u32) {
         self.scene.render_ctx = RenderContext::new(width as u16, height as u16);
+        self.scene.end_frame();
     }
 
     fn reset(&mut self) {
         self.scene.render_ctx.reset();
+        self.scene.end_frame();
     }
 
     fn render<F: FnOnce(&mut Self::ScenePainter<'_>)>(&mut self, draw_fn: F, buffer: &mut [u8]) {
@@ -63,6 +65,7 @@ impl ImageRenderer for VelloCpuImageRenderer {
         );
         timer.record_time("render");
 
+        self.scene.end_frame();
         self.scene.maintain();
         timer.record_time("maintain");
 

@@ -18,6 +18,9 @@ log_frame_times = [
   "pixels_window_renderer?/log_frame_times",
 ]
 filters = []
+# Backdrop filters (CSS backdrop-filter). The painter records each frame to replay
+# the backdrop of a layer with one.
+backdrop_filters = ["filters"]
 
 [dependencies]
 anyrender = { workspace = true }

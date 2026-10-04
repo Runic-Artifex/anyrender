@@ -14,6 +14,12 @@ pub struct VelloCpuScenePainter {
     pub(crate) render_ctx: vello_cpu::RenderContext,
     pub(crate) resources: vello_cpu::Resources,
     pub(crate) image_cache: ImageCache,
+    /// The commands painted since the last reset, replayed to draw the backdrop of a
+    /// layer with a backdrop filter, and the number of layers open.
+    #[cfg(feature = "backdrop_filters")]
+    recording: anyrender::recording::Scene,
+    #[cfg(feature = "backdrop_filters")]
+    open_layers: usize,
 }
 
 impl VelloCpuScenePainter {
@@ -26,7 +32,74 @@ impl VelloCpuScenePainter {
             render_ctx: vello_cpu::RenderContext::new(width, height),
             resources: vello_cpu::Resources::new(),
             image_cache: ImageCache::new(config),
+            #[cfg(feature = "backdrop_filters")]
+            recording: anyrender::recording::Scene::new(),
+            #[cfg(feature = "backdrop_filters")]
+            open_layers: 0,
         }
+    }
+
+    /// Forget the commands of the frame (called after each render and on reset).
+    pub(crate) fn end_frame(&mut self) {
+        #[cfg(feature = "backdrop_filters")]
+        {
+            self.recording.reset();
+            self.open_layers = 0;
+        }
+    }
+
+    /// Everything painted so far, with the open layers closed: the backdrop of a layer
+    /// pushed now.
+    #[cfg(feature = "backdrop_filters")]
+    fn backdrop(&self) -> Pixmap {
+        let mut painter =
+            VelloCpuScenePainter::new(self.render_ctx.width(), self.render_ctx.height());
+        painter.append_scene(self.recording.clone(), Affine::IDENTITY);
+        for _ in 0..painter.open_layers {
+            painter.pop_layer();
+        }
+        painter.render_ctx.flush();
+        painter.finish()
+    }
+
+    /// Draw the backdrop filtered by `backdrop_filter` behind a layer with the given
+    /// clip and opacity, as Chromium does: the filtered backdrop is composited with the
+    /// layer's opacity, then the layer over it. The filter reads the backdrop around the
+    /// clip as far as it reaches (a blur), beyond the viewport mirrored.
+    #[cfg(feature = "backdrop_filters")]
+    fn draw_filtered_backdrop(
+        &mut self,
+        backdrop_filter: vello_common::filter_effects::Filter,
+        fill: Fill,
+        alpha: f32,
+        transform: Affine,
+        clip: &kurbo::BezPath,
+    ) {
+        let backdrop = self.backdrop();
+        self.render_ctx.set_transform(transform);
+        self.render_ctx.set_fill_rule(fill);
+        self.render_ctx
+            .push_layer(Some(clip), None, Some(alpha), None, None);
+        let expansion = backdrop_filter.filter_expansion(&transform);
+        let bounds = transform.transform_rect_bbox(clip.bounding_box());
+        let area = Rect::new(
+            bounds.x0 + expansion.x0,
+            bounds.y0 + expansion.y0,
+            bounds.x1 + expansion.x1,
+            bounds.y1 + expansion.y1,
+        );
+        self.render_ctx.set_transform(transform);
+        self.render_ctx
+            .push_layer(None, None, None, None, Some(backdrop_filter));
+        self.render_ctx.set_transform(Affine::IDENTITY);
+        self.render_ctx.set_paint(PaintType::Image(ImageBrush {
+            image: vello_cpu::ImageSource::Pixmap(Arc::new(backdrop)),
+            sampler: peniko::ImageSampler::default().with_extend(peniko::Extend::Reflect),
+        }));
+        self.render_ctx.reset_paint_transform();
+        self.render_ctx.fill_rect(&area);
+        self.render_ctx.pop_layer();
+        self.render_ctx.pop_layer();
     }
 
     fn convert_paint(&mut self, paint: PaintRef<'_>) -> PaintType {
@@ -68,6 +141,7 @@ impl RenderContext for VelloCpuScenePainter {}
 impl PaintScene for VelloCpuScenePainter {
     fn reset(&mut self) {
         self.render_ctx.reset();
+        self.end_frame();
     }
 
     fn push_layer(
@@ -78,39 +152,76 @@ impl PaintScene for VelloCpuScenePainter {
         transform: Affine,
         clip: &impl Shape,
         filter: Option<Arc<Filter>>,
-        _backdrop_filter: Option<Arc<Filter>>,
+        backdrop_filter: Option<Arc<Filter>>,
     ) {
-        #[cfg(feature = "filters")]
-        let filter = filter
-            .and_then(crate::filters::convert_filter)
-            .filter(|_| cfg!(not(feature = "multithreading")));
+        let blend = blend.into();
+        let clip = clip.into_path(DEFAULT_TOLERANCE);
 
-        #[cfg(not(feature = "filters"))]
-        let filter = {
-            let _ = filter;
-            None
+        #[cfg(feature = "filters")]
+        let convert = |filter: &Option<Arc<Filter>>| {
+            filter
+                .clone()
+                .and_then(crate::filters::convert_filter)
+                .filter(|_| cfg!(not(feature = "multithreading")))
         };
+        #[cfg(not(feature = "filters"))]
+        let convert = |_: &Option<Arc<Filter>>| None;
+
+        // A backdrop filter draws the filtered backdrop behind the layer.
+        #[cfg(feature = "backdrop_filters")]
+        if let Some(backdrop) = convert(&backdrop_filter) {
+            self.draw_filtered_backdrop(backdrop, fill, alpha, transform, &clip);
+        }
+        #[cfg(not(feature = "backdrop_filters"))]
+        let _ = backdrop_filter;
+        #[cfg(feature = "backdrop_filters")]
+        let filter_arg = filter.clone();
 
         self.render_ctx.set_transform(transform);
         self.render_ctx.set_fill_rule(fill);
         self.render_ctx.push_layer(
-            Some(&clip.into_path(DEFAULT_TOLERANCE)),
-            Some(blend.into()),
+            Some(&clip),
+            Some(blend),
             Some(alpha),
             None,
-            filter,
+            convert(&filter),
         );
+
+        #[cfg(feature = "backdrop_filters")]
+        self.recording.push_layer(
+            fill,
+            blend,
+            alpha,
+            transform,
+            &clip,
+            filter_arg,
+            backdrop_filter,
+        );
+        #[cfg(feature = "backdrop_filters")]
+        {
+            self.open_layers += 1;
+        }
     }
 
     fn push_clip_layer(&mut self, fill: Fill, transform: Affine, clip: &impl Shape) {
+        let clip = clip.into_path(DEFAULT_TOLERANCE);
         self.render_ctx.set_transform(transform);
         self.render_ctx.set_fill_rule(fill);
-        self.render_ctx
-            .push_clip_layer(&clip.into_path(DEFAULT_TOLERANCE));
+        self.render_ctx.push_clip_layer(&clip);
+        #[cfg(feature = "backdrop_filters")]
+        {
+            self.recording.push_clip_layer(fill, transform, &clip);
+            self.open_layers += 1;
+        }
     }
 
     fn pop_layer(&mut self) {
         self.render_ctx.pop_layer();
+        #[cfg(feature = "backdrop_filters")]
+        {
+            self.recording.pop_layer();
+            self.open_layers = self.open_layers.saturating_sub(1);
+        }
     }
 
     fn stroke<'a>(
@@ -121,9 +232,13 @@ impl PaintScene for VelloCpuScenePainter {
         brush_transform: Option<Affine>,
         shape: &impl Shape,
     ) {
+        let paint = paint.into();
+        #[cfg(feature = "backdrop_filters")]
+        self.recording
+            .stroke(style, transform, paint.clone(), brush_transform, shape);
         self.render_ctx.set_transform(transform);
         self.render_ctx.set_stroke(style.clone());
-        let paint = self.convert_paint(paint.into());
+        let paint = self.convert_paint(paint);
         self.render_ctx.set_paint(paint);
         self.render_ctx
             .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY));
@@ -139,9 +254,13 @@ impl PaintScene for VelloCpuScenePainter {
         brush_transform: Option<Affine>,
         shape: &impl Shape,
     ) {
+        let paint = paint.into();
+        #[cfg(feature = "backdrop_filters")]
+        self.recording
+            .fill(style, transform, paint.clone(), brush_transform, shape);
         self.render_ctx.set_transform(transform);
         self.render_ctx.set_fill_rule(style);
-        let paint = self.convert_paint(paint.into());
+        let paint = self.convert_paint(paint);
         self.render_ctx.set_paint(paint);
         self.render_ctx
             .set_paint_transform(brush_transform.unwrap_or(Affine::IDENTITY));
@@ -158,16 +277,33 @@ impl PaintScene for VelloCpuScenePainter {
         embolden: kurbo::Vec2,
         style: impl Into<StyleRef<'a>>,
         paint: impl Into<PaintRef<'a>>,
-        _brush_alpha: f32,
+        brush_alpha: f32,
         transform: Affine,
         glyph_transform: Option<Affine>,
         glyphs: impl Iterator<Item = anyrender::Glyph> + Clone,
     ) {
+        let paint = paint.into();
+        let style: StyleRef<'a> = style.into();
+        #[cfg(feature = "backdrop_filters")]
+        self.recording.draw_glyphs(
+            font,
+            font_size,
+            hint,
+            normalized_coords,
+            embolden,
+            style,
+            paint.clone(),
+            brush_alpha,
+            transform,
+            glyph_transform,
+            glyphs.clone(),
+        );
+        #[cfg(not(feature = "backdrop_filters"))]
+        let _ = brush_alpha;
         self.render_ctx.set_transform(transform);
-        let paint = self.convert_paint(paint.into());
+        let paint = self.convert_paint(paint);
         self.render_ctx.set_paint(paint);
 
-        let style: StyleRef<'a> = style.into();
         match style {
             StyleRef::Fill(fill) => {
                 self.render_ctx.set_fill_rule(fill);
@@ -210,6 +346,9 @@ impl PaintScene for VelloCpuScenePainter {
         radius: f64,
         std_dev: f64,
     ) {
+        #[cfg(feature = "backdrop_filters")]
+        self.recording
+            .draw_box_shadow(transform, rect, color, radius, std_dev);
         self.render_ctx.set_transform(transform);
         self.render_ctx.set_paint(PaintType::Solid(color));
         self.render_ctx.reset_paint_transform();
@@ -291,5 +430,113 @@ mod clip_rule_tests {
     fn scene_replay_preserves_clip_rules() {
         assert_pixels(false, true);
         assert_pixels(true, true);
+    }
+}
+
+#[cfg(all(test, feature = "backdrop_filters"))]
+mod backdrop_filter_tests {
+    use std::sync::Arc;
+
+    use anyrender::{Filter, PaintScene, filters::FilterEffect, render_to_buffer};
+    use kurbo::{Affine, Rect};
+    use peniko::{Color, Fill, Mix};
+
+    use crate::VelloCpuImageRenderer;
+
+    /// Red left of x = 50 and blue right of it, under a layer over (20, 20, 80, 80)
+    /// with the given backdrop filter and a half-transparent white square in it.
+    pub(super) fn render(backdrop: Vec<FilterEffect>, nested: bool, alpha: f32) -> Vec<u8> {
+        let backdrop = Arc::new(Filter::linear_list(backdrop.into_iter()));
+        render_to_buffer::<VelloCpuImageRenderer, _>(
+            |scene| {
+                let left = Rect::new(0.0, 0.0, 50.0, 100.0);
+                let right = Rect::new(50.0, 0.0, 100.0, 100.0);
+                let red = Color::from_rgb8(255, 0, 0);
+                let blue = Color::from_rgb8(0, 0, 255);
+                if nested {
+                    // The backdrop is read through open layers.
+                    let all = Rect::new(0.0, 0.0, 100.0, 100.0);
+                    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &all);
+                }
+                scene.fill(Fill::NonZero, Affine::IDENTITY, red, None, &left);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, blue, None, &right);
+                let panel = Rect::new(20.0, 20.0, 80.0, 80.0);
+                scene.push_layer(
+                    Fill::NonZero,
+                    Mix::Normal,
+                    alpha,
+                    Affine::IDENTITY,
+                    &panel,
+                    None,
+                    Some(backdrop),
+                );
+                let dot = Rect::new(60.0, 60.0, 70.0, 70.0);
+                let white = Color::from_rgba8(255, 255, 255, 128);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, white, None, &dot);
+                scene.pop_layer();
+                if nested {
+                    scene.pop_layer();
+                }
+            },
+            100,
+            100,
+        )
+    }
+
+    pub(super) fn pixel(buffer: &[u8], x: usize, y: usize) -> [u8; 4] {
+        let i = (y * 100 + x) * 4;
+        [buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]
+    }
+
+    #[test]
+    fn backdrop_filters_filter_what_is_behind_the_layer() {
+        for nested in [false, true] {
+            let buffer = render(vec![FilterEffect::invert(1.0)], nested, 1.0);
+            // Inside the layer: the inverted backdrop, then the layer's content over it.
+            assert_eq!(pixel(&buffer, 30, 30), [0, 255, 255, 255]);
+            assert_eq!(pixel(&buffer, 55, 30), [255, 255, 0, 255]);
+            assert_eq!(pixel(&buffer, 65, 65), [255, 255, 128, 255]);
+            // Outside it, the backdrop is unchanged.
+            assert_eq!(pixel(&buffer, 10, 30), [255, 0, 0, 255]);
+            assert_eq!(pixel(&buffer, 90, 30), [0, 0, 255, 255]);
+        }
+    }
+
+    #[test]
+    fn backdrop_blurs_read_beyond_the_layer_but_stay_inside_it() {
+        let buffer = render(vec![FilterEffect::blur(4.0)], false, 1.0);
+        // Across the red/blue edge both colours mix inside the layer only.
+        let mixed = pixel(&buffer, 50, 30);
+        assert!(mixed[0] > 60 && mixed[2] > 60, "{mixed:?}");
+        assert_eq!(pixel(&buffer, 49, 10), [255, 0, 0, 255]);
+        assert_eq!(pixel(&buffer, 50, 10), [0, 0, 255, 255]);
+        // Near the layer's left edge the blur reads the red outside it: no fade.
+        assert_eq!(pixel(&buffer, 21, 30), [255, 0, 0, 255]);
+    }
+}
+
+#[cfg(all(test, feature = "backdrop_filters"))]
+mod backdrop_opacity_tests {
+    use super::backdrop_filter_tests::{pixel, render};
+    use anyrender::filters::FilterEffect;
+
+    /// As in Chromium, the filtered backdrop is composited with the layer's opacity,
+    /// then the layer's content with it over that.
+    #[test]
+    fn the_layer_opacity_applies_to_backdrop_and_content_separately() {
+        let buffer = render(vec![FilterEffect::invert(1.0)], false, 0.5);
+        let near = |actual: [u8; 4], expected: [u8; 3]| {
+            assert!(
+                actual[..3]
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, e)| a.abs_diff(e) <= 1),
+                "{actual:?}, expected {expected:?}"
+            )
+        };
+        // Half the inverted red over red.
+        near(pixel(&buffer, 30, 30), [128, 128, 128]);
+        // Half the white square (itself half transparent) over that, over blue.
+        near(pixel(&buffer, 65, 65), [160, 160, 160]);
     }
 }
