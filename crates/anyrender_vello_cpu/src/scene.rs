@@ -314,7 +314,7 @@ impl PaintScene for VelloCpuScenePainter {
                     .hint(hint)
                     .normalized_coords(normalized_coords)
                     .font_embolden(FontEmbolden::new(Diagonal2::new(embolden.x, embolden.y)))
-                    .glyph_transform(glyph_transform.unwrap_or_default())
+                    .glyph_transform(layout_glyph_transform(glyph_transform))
                     .fill_glyphs(glyphs.map(|g| vello_cpu::Glyph {
                         id: g.id,
                         x: g.x,
@@ -329,7 +329,7 @@ impl PaintScene for VelloCpuScenePainter {
                     .font_size(font_size)
                     .hint(hint)
                     .normalized_coords(normalized_coords)
-                    .glyph_transform(glyph_transform.unwrap_or_default())
+                    .glyph_transform(layout_glyph_transform(glyph_transform))
                     .stroke_glyphs(glyphs.map(|g| vello_cpu::Glyph {
                         id: g.id,
                         x: g.x,
@@ -539,4 +539,12 @@ mod backdrop_opacity_tests {
         // Half the white square (itself half transparent) over that, over blue.
         near(pixel(&buffer, 65, 65), [160, 160, 160]);
     }
+}
+
+/// The glyph transform in vello_cpu's convention. Callers give it in font
+/// space (y up), as vello does: a synthetic italic is `Affine::skew(tan, 0)`.
+/// vello_cpu applies it after flipping the outline into layout space (y down),
+/// where that skew leans the glyphs left, so it is conjugated with the flip.
+fn layout_glyph_transform(transform: Option<Affine>) -> Affine {
+    transform.map_or(Affine::IDENTITY, |t| Affine::FLIP_Y * t * Affine::FLIP_Y)
 }
